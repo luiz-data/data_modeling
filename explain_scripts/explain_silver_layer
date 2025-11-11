@@ -1,0 +1,467 @@
+# 🥈 Camada Silver - Guia de Implementação
+
+## 📋 Índice
+- [O que é a Camada Silver?](#o-que-é-a-camada-silver)
+- [Bronze vs Silver](#bronze-vs-silver)
+- [Estrutura do Projeto](#estrutura-do-projeto)
+- [Explicação do Código](#explicação-do-código)
+- [Transformações Aplicadas](#transformações-aplicadas)
+- [Como Executar](#como-executar)
+- [Star Schema na Silver](#star-schema-na-silver)
+
+---
+
+## 🎯 O que é a Camada Silver?
+
+A **Camada Silver** é a segunda camada da Arquitetura Medallion. Seu objetivo é **limpar, validar e enriquecer** os dados brutos vindos da Bronze, preparando-os para análise.
+
+### Princípios
+- ✅ **Dados limpos**: Tratamento de nulos, duplicatas e inconsistências
+- ✅ **Validações**: Regras de negócio aplicadas (ex: datas inválidas)
+- ✅ **Enriquecimento**: Cálculos derivados (idade, totais, durações)
+- ✅ **Padronização**: Formatos consistentes (nomes, códigos)
+- ✅ **Preparação para Star Schema**: Surrogate Keys e relacionamentos
+
+---
+
+## 🔄 Bronze vs Silver
+
+| Aspecto | Bronze (Raw) | Silver (Cleaned) |
+|---------|-------------|------------------|
+| **Dados** | Brutos, sem tratamento | Limpos e validados |
+| **Qualidade** | Aceita inconsistências | Aplica regras de negócio |
+| **Transformações** | Nenhuma | Limpeza, cálculos, enriquecimento |
+| **Schema** | Réplica do OLTP | Preparado para Star Schema |
+| **Chaves** | Natural Keys (IDs originais) | Surrogate Keys (SKs) |
+| **Uso** | Auditoria, histórico | Análise, relatórios |
+
+**Fluxo:**
+```
+OLTP → 🥉 Bronze (raw) → 🥈 Silver (cleaned) → 🥇 Gold (star schema)
+```
+
+---
+
+## 📁 Estrutura do Projeto
+
+```
+project/
+├── .env
+├── scripts/
+│   ├── load_bronze.py          # Carga Bronze
+│   └── load_silver.py          # Carga Silver ← Você está aqui
+└── data/
+    ├── bronze_*.sql            # Dados brutos
+    └── silver_*.sql            # Dados limpos (gerados)
+```
+
+---
+
+## 🔍 Explicação do Código
+
+### 1. Imports Principais
+
+```python
+import pandas as pd              # Transformações em memória
+import numpy as np               # Operações numéricas
+from sqlalchemy import create_engine, text
+from datetime import datetime
+import pytz                      # Timezone UTC para auditoria
+```
+
+**Por quê pandas na Silver?**
+- ✅ Transformações complexas em memória
+- ✅ Funções vetorizadas (performance)
+- ✅ Tratamento de nulos (NaN, NaT, pd.NA)
+- ⚠️ Atenção ao uso de memória com grandes volumes
+
+---
+
+### 2. Funções de Transformação Genéricas
+
+#### **`calculate_age()` - Cálculo de Idade**
+
+```python
+def calculate_age(date_of_birth, as_of_date=None):
+    """
+    Calcula idade de forma vetorizada.
+    Retorna pd.NA para datas inválidas ou futuras.
+    """
+    if as_of_date is None:
+        as_of_date = datetime.now(pytz.utc).date()
+    
+    # Converte para datetime
+    dob_series = pd.to_datetime(date_of_birth, errors='coerce').dt.date
+    
+    # Calcula idade inicial (diferença de anos)
+    age = as_of_date.year - dob_series.apply(lambda x: x.year)
+    
+    # Ajusta se aniversário não ocorreu ainda
+    needs_adjustment = (
+        (as_of_date.month < dob_series.apply(lambda x: x.month)) |
+        ((as_of_date.month == dob_series.apply(lambda x: x.month)) & 
+         (as_of_date.day < dob_series.apply(lambda x: x.day)))
+    )
+    age[needs_adjustment] -= 1
+    
+    # Trata idades negativas (nascimento futuro)
+    age[age < 0] = pd.NA
+    
+    return age.astype('Int64')
+```
+
+**O que faz:**
+- Converte string/datetime para idade numérica
+- Ajusta se aniversário não passou
+- Retorna `pd.NA` para datas inválidas
+
+#### **`derive_age_group()` - Faixas Etárias**
+
+```python
+def derive_age_group(age_series):
+    """Cria faixas etárias a partir de idades."""
+    bins = [-1, 12, 17, 25, 35, 45, 60, 75, float('inf')]
+    labels = ['0-12', '13-17', '18-25', '26-35', '36-45', '46-60', '61-75', '75+']
+    
+    return pd.cut(age_series, bins=bins, labels=labels, right=True) \
+             .astype(str).replace('nan', 'Unknown')
+```
+
+**Resultado:**
+```
+Idade 8  → '0-12'
+Idade 22 → '18-25'
+Idade 65 → '61-75'
+Idade NA → 'Unknown'
+```
+
+---
+
+### 3. Transformações Específicas por Tabela
+
+#### **A. Dimensão: Pacientes (Patients)**
+
+```python
+def transform_patients_to_silver(df):
+    """Transforma pacientes Bronze → Silver (Dimensão)."""
+    df = df.copy()
+    
+    # 1. Gera Surrogate Key (SK)
+    df['patient_sk'] = pd.factorize(df['patient_id'])[0] + 1
+    
+    # 2. Padroniza nomes
+    df['first_name'] = df['first_name'].str.strip().str.title().fillna('')
+    df['last_name'] = df['last_name'].str.strip().str.title().fillna('')
+    df['full_name'] = df['first_name'] + ' ' + df['last_name']
+    
+    # 3. Calcula idade e faixa etária
+    df['date_of_birth'] = pd.to_datetime(df['date_of_birth'], errors='coerce')
+    df['age'] = calculate_age(df['date_of_birth'])
+    df['age_group'] = derive_age_group(df['age'])
+    
+    # 4. Adiciona auditoria
+    now_utc = datetime.now(pytz.utc).replace(microsecond=0)
+    df['dw_created_at'] = now_utc
+    df['dw_updated_at'] = now_utc
+    
+    # 5. Seleciona colunas finais
+    return df[['patient_sk', 'patient_id', 'full_name', 'date_of_birth', 
+               'age', 'age_group', 'dw_created_at', 'dw_updated_at']]
+```
+
+**Transformações aplicadas:**
+1. **SK gerado**: `patient_sk` (1, 2, 3...)
+2. **Nome padronizado**: `"joao silva"` → `"João Silva"`
+3. **Enriquecimento**: Calcula `age` e `age_group`
+4. **Auditoria**: Adiciona timestamps UTC
+
+**Antes (Bronze):**
+```
+patient_id | first_name | last_name | date_of_birth
+1          | joao       | silva     | 1985-03-15
+```
+
+**Depois (Silver):**
+```
+patient_sk | patient_id | full_name   | age | age_group | dw_created_at
+1          | 1          | João Silva  | 39  | 36-45     | 2024-11-11 10:30:00
+```
+
+---
+
+#### **B. Dimensão: Provedores (Providers)**
+
+```python
+def transform_providers_to_silver(bronze_claims_df, bronze_encounters_df):
+    """Infere provedores únicos de Claims e Encounters."""
+    
+    # 1. Coleta provider_ids de múltiplas fontes
+    providers_claims = bronze_claims_df[['provider_id']].drop_duplicates()
+    providers_encounters = bronze_encounters_df[['provider_id']].drop_duplicates()
+    
+    # 2. Combina e remove duplicatas
+    all_providers = pd.concat([providers_claims, providers_encounters]) \
+                      .drop_duplicates().reset_index(drop=True)
+    
+    # 3. Gera SK
+    all_providers['provider_sk'] = pd.factorize(all_providers['provider_id'])[0] + 1
+    
+    # 4. Nome genérico (sem tabela de provedores na Bronze)
+    all_providers['provider_name'] = "Provider " + all_providers['provider_id'].astype(str)
+    
+    # 5. Auditoria
+    now_utc = datetime.now(pytz.utc).replace(microsecond=0)
+    all_providers['dw_created_at'] = now_utc
+    all_providers['dw_updated_at'] = now_utc
+    
+    return all_providers[['provider_sk', 'provider_id', 'provider_name', 
+                          'dw_created_at', 'dw_updated_at']]
+```
+
+**Por que inferir provedores?**
+- Não há tabela `bronze_providers` no OLTP
+- Provedores aparecem em `claims` e `encounters`
+- Consolidamos IDs únicos em uma dimensão
+
+---
+
+#### **C. Fato: Claims**
+
+```python
+def transform_claims_to_silver(bronze_claims_df, silver_patients_df, silver_providers_df):
+    """Transforma claims Bronze → Silver (Fato)."""
+    df = bronze_claims_df.copy()
+    
+    # 1. Converte datas
+    df['claim_start_date'] = pd.to_datetime(df['claim_start_date'], errors='coerce')
+    df['claim_end_date'] = pd.to_datetime(df['claim_end_date'], errors='coerce')
+    
+    # 2. Converte valores monetários
+    for col in ['outstanding_primary', 'outstanding_secondary', 'outstanding_patient']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    # 3. Calcula total
+    df['total_outstanding'] = (df['outstanding_primary'] + 
+                               df['outstanding_secondary'] + 
+                               df['outstanding_patient'])
+    
+    # 4. Validação de datas
+    df.loc[df['claim_start_date'] > df['claim_end_date'], 'claim_end_date'] = pd.NaT
+    
+    # 5. Adiciona SKs das dimensões (JOIN)
+    df = pd.merge(df, silver_patients_df[['patient_id', 'patient_sk']], 
+                  on='patient_id', how='left')
+    df = pd.merge(df, silver_providers_df[['provider_id', 'provider_sk']], 
+                  on='provider_id', how='left')
+    
+    # 6. Auditoria
+    now_utc = datetime.now(pytz.utc).replace(microsecond=0)
+    df['dw_created_at'] = now_utc
+    df['dw_updated_at'] = now_utc
+    
+    return df[['claim_id', 'patient_sk', 'provider_sk', 
+               'claim_start_date', 'claim_end_date', 'total_outstanding',
+               'dw_created_at', 'dw_updated_at']]
+```
+
+**Transformações aplicadas:**
+1. **Conversão de tipos**: Datas e valores numéricos
+2. **Cálculo**: `total_outstanding` = soma de 3 campos
+3. **Validação**: Se `start > end`, `end` vira `NULL`
+4. **Enriquecimento**: Adiciona `patient_sk` e `provider_sk`
+
+**Antes (Bronze):**
+```
+claim_id | patient_id | provider_id | outstanding_primary
+C001     | 123        | P456        | 100.50
+```
+
+**Depois (Silver):**
+```
+claim_id | patient_sk | provider_sk | total_outstanding | dw_created_at
+C001     | 1          | 5           | 150.75            | 2024-11-11 10:30:00
+```
+
+---
+
+#### **D. Fato: Encounters**
+
+```python
+def transform_encounters_to_silver(bronze_encounters_df, silver_patients_df, 
+                                   silver_providers_df, silver_payers_df):
+    """Transforma encounters Bronze → Silver (Fato)."""
+    df = bronze_encounters_df.copy()
+    
+    # 1. Converte datas
+    df['encounter_date'] = pd.to_datetime(df['encounter_date'], errors='coerce')
+    df['discharge_date'] = pd.to_datetime(df['discharge_date'], errors='coerce')
+    
+    # 2. Padroniza tipo
+    df['encounter_type'] = df['encounter_type'].str.strip().str.title().fillna('Unknown Type')
+    
+    # 3. Converte valores
+    for col in ['total_claim_cost', 'payer_coverage']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    # 4. Validação de datas
+    df.loc[df['encounter_date'] > df['discharge_date'], 'discharge_date'] = pd.NaT
+    
+    # 5. Calcula tempo de internação
+    df['length_of_stay_days'] = (df['discharge_date'] - df['encounter_date']).dt.days
+    df['length_of_stay_days'] = df['length_of_stay_days'].apply(
+        lambda x: max(0, x) if pd.notna(x) else pd.NA
+    ).astype('Int64')
+    
+    # 6. Adiciona SKs das dimensões
+    df = pd.merge(df, silver_patients_df[['patient_id', 'patient_sk']], on='patient_id', how='left')
+    df = pd.merge(df, silver_providers_df[['provider_id', 'provider_sk']], on='provider_id', how='left')
+    df = pd.merge(df, silver_payers_df[['payer_id', 'payer_sk']], on='payer_id', how='left')
+    
+    # 7. Auditoria
+    now_utc = datetime.now(pytz.utc).replace(microsecond=0)
+    df['dw_created_at'] = now_utc
+    df['dw_updated_at'] = now_utc
+    
+    return df[['encounter_id', 'patient_sk', 'provider_sk', 'payer_sk',
+               'encounter_date', 'discharge_date', 'encounter_type',
+               'total_claim_cost', 'payer_coverage', 'length_of_stay_days',
+               'dw_created_at', 'dw_updated_at']]
+```
+
+**Cálculo destaque:**
+```python
+# Tempo de internação em dias
+length_of_stay_days = discharge_date - encounter_date
+```
+
+**Exemplo:**
+```
+encounter_date: 2024-01-10
+discharge_date: 2024-01-15
+length_of_stay_days: 5
+```
+
+---
+
+### 4. Função Principal: `load_silver()`
+
+```python
+def load_silver():
+    engine = get_engine()
+    if engine is None:
+        return
+    
+    # 1. EXTRAI dados da Bronze
+    print("Lendo dados da camada Bronze...")
+    patients_bronze = pd.read_sql("SELECT * FROM bronze_patients", engine)
+    claims_bronze = pd.read_sql("SELECT * FROM bronze_claims", engine)
+    claims_transactions_bronze = pd.read_sql("SELECT * FROM bronze_claims_transactions", engine)
+    payers_bronze = pd.read_sql("SELECT * FROM bronze_payers", engine)
+    encounters_bronze = pd.read_sql("SELECT * FROM bronze_encounters", engine)
+    
+    # 2. TRANSFORMA Dimensões primeiro (necessárias para Fatos)
+    print("Aplicando transformações (Dimensões)...")
+    silver_patients = transform_patients_to_silver(patients_bronze)
+    silver_payers = transform_payers_to_silver(payers_bronze)
+    silver_providers = transform_providers_to_silver(claims_bronze, encounters_bronze)
+    
+    # 3. CARREGA Dimensões
+    print("Carregando Dimensões na Silver...")
+    silver_patients.to_sql("silver_dim_patient", engine, if_exists="replace", index=False)
+    silver_payers.to_sql("silver_dim_payer", engine, if_exists="replace", index=False)
+    silver_providers.to_sql("silver_dim_provider", engine, if_exists="replace", index=False)
+    
+    # 4. TRANSFORMA Fatos (dependem das SKs das Dimensões)
+    print("Aplicando transformações (Fatos)...")
+    silver_claims = transform_claims_to_silver(claims_bronze, silver_patients, silver_providers)
+    silver_claims_transactions = transform_claims_transactions_to_silver(
+        claims_transactions_bronze, silver_patients, silver_providers, silver_claims
+    )
+    silver_encounters = transform_encounters_to_silver(
+        encounters_bronze, silver_patients, silver_providers, silver_payers
+    )
+    
+    # 5. CARREGA Fatos
+    print("Carregando Fatos na Silver...")
+    silver_claims.to_sql("silver_fact_claim", engine, if_exists="replace", index=False)
+    silver_claims_transactions.to_sql("silver_fact_claim_transaction", engine, if_exists="replace", index=False)
+    silver_encounters.to_sql("silver_fact_encounter", engine, if_exists="replace", index=False)
+    
+    print("\n✅ Carga da camada Silver concluída com sucesso.")
+```
+
+**Ordem de execução:**
+```
+1. Extrair Bronze → pandas DataFrames
+2. Transformar Dimensões (Patients, Payers, Providers)
+3. Carregar Dimensões → Banco (gera SKs)
+4. Transformar Fatos (Claims, Transactions, Encounters) - usa SKs das Dimensões
+5. Carregar Fatos → Banco
+```
+
+---
+
+## 🔄 Transformações Aplicadas
+
+### Checklist de Transformações na Silver
+
+| Transformação | Exemplo | Aplicado em |
+|---------------|---------|-------------|
+| **Limpeza de nulos** | `fillna(0)`, `fillna('Unknown')` | Todos |
+| **Padronização** | `.str.strip().str.title()` | Nomes, tipos |
+| **Conversão de tipos** | `pd.to_datetime()`, `pd.to_numeric()` | Datas, valores |
+| **Validações** | `if start > end: end = NULL` | Datas |
+| **Cálculos derivados** | `age`, `total_outstanding`, `length_of_stay` | Fatos |
+| **Surrogate Keys** | `pd.factorize()` | Dimensões |
+| **Enriquecimento** | `age_group`, `full_name` | Dimensões |
+| **Auditoria** | `dw_created_at`, `dw_updated_at` | Todos |
+
+---
+
+
+
+###  Verificar tabelas criadas
+
+```sql
+-- Dimensões
+SELECT * FROM silver_dim_patient LIMIT 5;
+SELECT * FROM silver_dim_payer LIMIT 5;
+SELECT * FROM silver_dim_provider LIMIT 5;
+
+-- Fatos
+SELECT * FROM silver_fact_claim LIMIT 5;
+SELECT * FROM silver_fact_encounter LIMIT 5;
+SELECT * FROM silver_fact_claim_transaction LIMIT 5;
+```
+
+---
+
+## ⭐ Star Schema na Silver
+
+A Silver já organiza dados em **Dimensões** e **Fatos**, preparando o Star Schema para a Gold:
+
+```
+         silver_dim_patient
+                 │
+                 │ patient_sk
+                 ▼
+         silver_fact_claim ◄─────── silver_dim_provider
+                 │                          │
+                 │                   provider_sk
+                 │
+         silver_fact_encounter ◄──── silver_dim_payer
+                                            │
+                                     payer_sk
+```
+
+### Diferença Silver → Gold
+
+| Aspecto | Silver | Gold |
+|---------|--------|------|
+| **Estrutura** | Dimensões + Fatos separados | Star Schema completo |
+| **Joins** | Realizados manualmente | Pré-calculados em views |
+| **Agregações** | Dados detalhados | Agregações pré-computadas |
+| **Uso** | Preparação, análise exploratória | Dashboards, relatórios finais |
+
+---
+
